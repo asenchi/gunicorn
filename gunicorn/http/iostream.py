@@ -24,62 +24,88 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-
-
-from errno import EALREADY, EINPROGRESS, EWOULDBLOCK, ECONNRESET, \
-     ENOTCONN, ESHUTDOWN, EINTR, EISCONN, EBADF, ECONNABORTED, errorcode
-     
+import errno
 import socket
-
-SOCKET_CLOSED = (ECONNRESET, ENOTCONN, ESHUTDOWN)
+import logging
 
 class IOStream(object):
-    
-    chunk_size = 4096
-    
-    def __init__(self, sock):
-        self.sock = sock
-        self.buf = "" 
-        
-    def recv(self, buffer_size):
-        
-        buffer_size = buffer_size or 0
-        if self.buf:
-            l = len(self.buf)
-            if buffer_size > l:
-                buffer_size -= l
-            else:
-                s = self.buf[:buffer_size]
-                self.buf = self.buf[buffer_size:]
-                return s
+
+    def __init__(self, socket, max_buffer_size=104857600, recv_chunk_size=4096):
+        self.socket = socket
+        self.max_buffer_size = max_buffer_size
+        self.recv_chunk_size = recv_chunk_size
+        self._recv_buffer = ""
+        self._send_buffer = ""
+
+    def recv(self):
         try:
-            data =  self.sock.recv(buffer_size)
-            s = self.buf + data
-            self.buf = ''
-            return s
+            chunk = self.socket.recv(self.recv_chunk_size)
         except socket.error, e:
-            if e[0] == EWOULDBLOCK:
-                return None
-            if e[0] in SOCKET_CLOSED:
-                return ''
-            raise
-           
+            if e[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return ""
+            elif e[0] in (errno.ECONNRESET, errno.ENOTCONN, errno.ESHUTDOWN):
+                logging.warning("connection lost, %s", e)
+                self.close()
+                return ""
+            else:
+                self.close()
+                return
+        if not chunk:
+            self.close()
+            return
+
+        self._recv_buffer += chunk
+        if len(self._recv_buffer) > self.max_buffer_size:
+            logging.error("Reached max buffer size")
+            self.close()
+            return
+        else:
+            return self._recv_buffer
+
     def send(self, data):
-        return self.sock.send(data)
+        if not self.socket:
+            raise IOError("Closed")
+
+        self._send_buffer += data
+        while self._send_buffer:
+            try:
+                num_bytes = self.socket.send(self._send_buffer)
+                self._send_buffer = self._send_buffer[num_bytes:]
+                return num_bytes
+            except socket.error, e:
+                if e[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    break
+                else:
+                    self.close()
+                    return
+
+    def sending(self):
+        return len(self._send_buffer) > 0
 
     def read_until(self, delimiter):
+        if not self.socket:
+            raise IOError("Closed")
+
         while True:
             try:
-                data = self.recv(self.chunk_size)
+                chunk = self.recv()
             except socket.error, e:
                 return
-            self.buf = self.buf + data
-            
-            lb = len(self.buf)
-            ld = len(delimiter)
-            i = self.buf.find(delimiter)
+            self._recv_buffer += str(chunk)
+
+            buflen = len(self._recv_buffer)
+            dellen = len(delimiter)
+            i = self._recv_buffer.find(delimiter)
             if i != -1:
                 if i > 0:
-                    r = self.buf[:i]
-                self.buf = self.buf[i+ ld:]
-                return r
+                    data = self._recv_buffer[:i]
+                self._recv_buffer = self._recv_buffer[i + dellen:]
+                return data
+
+    def close(self):
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+    def closed(self):
+        return self.socket is None
