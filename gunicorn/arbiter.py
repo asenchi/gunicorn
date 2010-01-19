@@ -1,28 +1,7 @@
 # -*- coding: utf-8 -
 #
-# 2009 (c) Benoit Chesneau <benoitc@e-engura.com> 
-# 2009 (c) Paul J. Davis <paul.joseph.davis@gmail.com>
-#
-# Permission is hereby granted, free of charge, to any person
-# obtaining a copy of this software and associated documentation
-# files (the "Software"), to deal in the Software without
-# restriction, including without limitation the rights to use,
-# copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following
-# conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
-# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-# OTHER DEALINGS IN THE SOFTWARE.
+# This file is part of gunicorn released under the MIT license. 
+# See the NOTICE for more information.
 
 import errno
 import fcntl
@@ -34,9 +13,8 @@ import socket
 import sys
 import time
 
-from worker import Worker
+from gunicorn.worker import Worker
 
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 class Arbiter(object):
@@ -49,7 +27,7 @@ class Arbiter(object):
     SIG_QUEUE = []
     SIGNALS = map(
         lambda x: getattr(signal, "SIG%s" % x),
-        "CHLD HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()
+        "HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()
     )
     SIG_NAMES = dict(
         (getattr(signal, name), name[3:].lower()) for name in dir(signal)
@@ -74,17 +52,19 @@ class Arbiter(object):
         map(self.set_non_blocking, pair)
         map(lambda p: fcntl.fcntl(p, fcntl.F_SETFD, fcntl.FD_CLOEXEC), pair)
         map(lambda s: signal.signal(s, self.signal), self.SIGNALS)
+        signal.signal(signal.SIGCHLD, self.handle_chld)
     
     def set_non_blocking(self, fd):
         flags = fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK
         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
-    
+
     def signal(self, sig, frame):
         if len(self.SIG_QUEUE) < 5:
             self.SIG_QUEUE.append(sig)
+            self.wakeup()
         else:
             log.warn("Ignoring rapid signaling: %s" % sig)
-        self.wakeup()
+        
 
     def listen(self, addr):
         if 'GUNICORN_FD' in os.environ:
@@ -125,20 +105,24 @@ class Arbiter(object):
         return sock
         
     def set_sockopts(self, sock):
+        sock.setblocking(0)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if hasattr(socket, "TCP_CORK"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
         elif hasattr(socket, "TCP_NOPUSH"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NOPUSH, 1)
-            
+
     def run(self):
         self.manage_workers()
         while True:
             try:
+                self.reap_workers()
                 sig = self.SIG_QUEUE.pop(0) if len(self.SIG_QUEUE) else None
                 if sig is None:
                     self.sleep()
+                    self.murder_workers()
+                    self.manage_workers()
                     continue
                 
                 if sig not in self.SIG_NAMES:
@@ -151,11 +135,7 @@ class Arbiter(object):
                     log.error("Unhandled signal: %s" % signame)
                     continue
                 log.info("Handling signal: %s" % signame)
-                handler()
-                
-                self.murder_workers()
-                self.reap_workers()
-                self.manage_workers()
+                handler()     
             except StopIteration:
                 break
             except KeyboardInterrupt:
@@ -169,7 +149,7 @@ class Arbiter(object):
         log.info("Master is shutting down.")
         self.stop()
         
-    def handle_chld(self):
+    def handle_chld(self, sig, frame):
         self.wakeup()
         
     def handle_hup(self):
@@ -252,8 +232,8 @@ class Arbiter(object):
 
     def murder_workers(self):
         for (pid, worker) in list(self.WORKERS.items()):
-            diff = time.time() - os.fstat(worker.tmp.fileno()).st_mtime
-            if diff < self.timeout:
+            diff = time.time() - os.fstat(worker.tmp.fileno()).st_ctime
+            if diff <= self.timeout:
                 continue
             self.kill_worker(pid, signal.SIGKILL)
     
@@ -287,7 +267,8 @@ class Arbiter(object):
             if i in workers:
                 continue
 
-            worker = Worker(i, self.pid, self.LISTENER, self.modname)
+            worker = Worker(i, self.pid, self.LISTENER, self.modname,
+                        self.timeout / 2.0)
             pid = os.fork()
             if pid != 0:
                 self.WORKERS[pid] = worker

@@ -1,36 +1,78 @@
 # -*- coding: utf-8 -
 #
-# 2009 (c) Benoit Chesneau <benoitc@e-engura.com> 
-# 2009 (c) Paul J. Davis <paul.joseph.davis@gmail.com>
-#
-# Permission is hereby granted, free of charge, to any person
-# obtaining a copy of this software and associated documentation
-# files (the "Software"), to deal in the Software without
-# restriction, including without limitation the rights to use,
-# copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following
-# conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
-# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-# OTHER DEALINGS IN THE SOFTWARE.
+# This file is part of gunicorn released under the MIT license. 
+# See the NOTICE for more information.
 
+import errno
+import select
+import socket
 import time
+
+timeout_default = object()
+
+CHUNK_SIZE = (16 * 1024)
+
+MAX_BODY = 1024 * (80 + 32)
 
 weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 monthname = [None,
              'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  
+  
+def close(sock):
+    """ socket.close() doesn't *really* close if 
+    there's another reference to it in the TCP/IP stack. 
+    (trick from twisted)"""
+    try:
+        sock.shutdown(2)
+    except socket.error:
+        pass
+    try:
+        sock.close()
+    except socket.error:
+        pass
+  
+def read_partial(sock, length):
+    while True:
+        try:
+            ret = select.select([sock.fileno()], [], [])
+            if ret[0]: break
+        except select.error, e:
+            if e[0] == errno.EINTR:
+                break
+            raise
+    data = sock.recv(length)
+    return data
+    
+def write(sock, data):
+    buf = ""
+    buf += data
+    while buf:
+        try:
+            bytes = sock.send(buf)
+            if bytes < len(buf):
+                buf = buf[bytes:]
+                continue
+            return len(data)
+        except socket.error, e:
+            if e[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
+                break
+            elif e[0] in (errno.EPIPE,):
+                continue
+            raise
+                
+def write_nonblock(sock, data):
+    while True:
+        try:
+            ret = select.select([], [sock.fileno()], [], 2.0)
+            if ret[1]: break
+        except socket.error, e:
+            if e[0] == errno.EINTR:
+                break
+            raise
+    write(sock, data)
 
 def import_app(module):
     parts = module.rsplit(":", 1)
